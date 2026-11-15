@@ -24,6 +24,7 @@
     {% if view.state.status == 'published' %}
     <div><dt>发布大小</dt><dd>{{ view.state.published_size }} 字节</dd></div>
     <div><dt>发布时间</dt><dd>{{ view.state.published_at }}</dd></div>
+    <div><dt>存储层</dt><dd><span class="tier-badge {{ view.tier }}">{{ view.tier_label }}</span></dd></div>
     <div class="wide"><dt>发布摘要</dt><dd class="mono verified">{{ view.state.published_sha256 }}</dd></div>
     {% elif view.state.actual_sha256 %}
     <div class="wide"><dt>当前实际摘要（不符）</dt><dd class="mono bad">{{ view.state.actual_sha256 }}</dd></div>
@@ -77,6 +78,17 @@
       已发布档案不会因迟到分片而改变。
     </div>
     <a class="button primary" href="/deliveries/{{ view.delivery.transfer_id }}/download">下载 {{ view.delivery.transfer_id }}.bin</a>
+    {% if view.migratable %}
+    <form method="post" action="/deliveries/{{ view.delivery.transfer_id }}/migrate" class="inline-form">
+      <button type="submit" class="secondary">迁移到冷存储卷</button>
+    </form>
+    <p class="hint">
+      为采集盘腾出空间：先在冷盘生成副本并按登记字节数与 SHA-256 核验，一致后才切换存储层，
+      随后清理快盘副本。下载地址不变，迁移期间下载不受影响。
+    </p>
+    {% elif view.tier == 'cold' %}
+    <p class="hint">档案已位于冷层·归档卷，快盘副本已清理；下载地址不变。</p>
+    {% endif %}
   {% endif %}
 </section>
 
@@ -131,7 +143,10 @@
       <span class="at mono">{{ row.at }}</span>
       <span class="event">{{ {
         'registered':'登记','frames':'接收分片','parity':'接收校验帧',
-        'digest-mismatch':'摘要不符','published':'核验发布','recovered':'校验帧恢复'
+        'digest-mismatch':'摘要不符','published':'核验发布','recovered':'校验帧恢复',
+        'migrate-copy':'冷盘副本核验','migrate-switch':'切换存储层',
+        'migrate-cleanup':'清理快盘副本','migrate-rollback':'回退存储层',
+        'migrate-resume':'自愈完成迁移'
       }.get(row.event, row.event) }}</span>
       <span class="detail mono small">{{ row.detail }}</span>
     </li>

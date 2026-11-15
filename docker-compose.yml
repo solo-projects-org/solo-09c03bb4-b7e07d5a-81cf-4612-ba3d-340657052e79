@@ -1,20 +1,51 @@
-# 地震波形原档接收台 — 单服务 + 持久卷，一条命令启动：
+# 地震波形原档接收台 — 双实例 + 持久卷，一条命令启动：
 #   docker compose up --build
-# 打开 http://localhost:8080 ；样例分片位于镜像内 /app/samples（也可用仓库内 samples/）。
+# 打开 http://localhost:8080 （第二实例 http://localhost:8081，挂载同一组卷，
+# 用于验证多实例并发迁移/下载安全）；样例分片位于镜像内 /app/samples（也可用仓库内 samples/）。
 services:
   intake:
     build:
       context: .
       dockerfile: Dockerfile
-    image: seismic-archive-intake:1.0.0
+    image: seismic-archive-intake:1.1.0
     container_name: seismic-archive-intake
     ports:
       - "${INTAKE_PORT:-8080}:8080"
     environment:
       ARCHIVE_DATA_DIR: /data
+      ARCHIVE_COLD_DIR: /cold
       TZ: Asia/Shanghai
     volumes:
       - archive-data:/data
+      - archive-cold:/cold
+      - ./samples:/app/samples:ro
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  intake-b:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: seismic-archive-intake:1.1.0
+    container_name: seismic-archive-intake-b
+    ports:
+      - "${INTAKE_B_PORT:-8081}:8080"
+    environment:
+      ARCHIVE_DATA_DIR: /data
+      ARCHIVE_COLD_DIR: /cold
+      TZ: Asia/Shanghai
+    volumes:
+      - archive-data:/data
+      - archive-cold:/cold
       - ./samples:/app/samples:ro
     restart: unless-stopped
     healthcheck:
@@ -30,3 +61,4 @@ services:
 
 volumes:
   archive-data:
+  archive-cold:

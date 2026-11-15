@@ -49,6 +49,11 @@ STATUS_WAITING = "waiting"
 STATUS_MISMATCH = "mismatch"
 STATUS_PUBLISHED = "published"
 
+# Storage tiers: every archive is published onto the fast acquisition disk
+# (``hot``) and may later be migrated onto the cold storage volume (``cold``).
+TIER_HOT = "hot"
+TIER_COLD = "cold"
+
 
 class StorageError(Exception):
     """Base class for user-facing intake errors."""
@@ -175,6 +180,7 @@ class ArchiveState:
     published_sha256: str | None
     published_size: int | None
     published_at: str | None
+    tier: str
     missing_frames: tuple[int, ...]
     parity_recoverable: bool
     actual_sha256: str | None
@@ -204,19 +210,45 @@ class ArchiveState:
 
 
 class Storage:
-    """SQLite metadata + filesystem fragment store rooted at ``root``."""
+    """SQLite metadata + filesystem fragment store rooted at ``root``.
 
-    def __init__(self, root: str | os.PathLike[str]) -> None:
+    ``cold_root`` is an optional second filesystem (the cold storage volume).
+    Published archives can be migrated there; the relative ``pub_path`` is
+    identical on both tiers, so switching tiers only flips a column.
+    """
+
+    def __init__(
+        self,
+        root: str | os.PathLike[str],
+        cold_root: str | os.PathLike[str] | None = None,
+    ) -> None:
         self.root = Path(root)
         self.tmp_dir = self.root / "tmp"
         self.published_dir = self.root / "published"
         for directory in (self.root, self.tmp_dir, self.published_dir):
             directory.mkdir(parents=True, exist_ok=True)
+        self.cold_root = Path(cold_root) if cold_root is not None else None
+        self.cold_tmp_dir: Path | None = None
+        if self.cold_root is not None:
+            self.cold_tmp_dir = self.cold_root / "tmp"
+            for directory in (self.cold_root, self.cold_tmp_dir, self.cold_root / "published"):
+                directory.mkdir(parents=True, exist_ok=True)
         self.db_path = self.root / "archive.sqlite3"
         self._lock_path = self.root / ".intake.lock"
         self._write_lock = threading.RLock()
         self._init_db()
         self.sanitize_startup()
+
+    @property
+    def cold_enabled(self) -> bool:
+        return self.cold_root is not None
+
+    def _tier_root(self, tier: str | None) -> Path:
+        if tier == TIER_COLD:
+            if self.cold_root is None:
+                raise ConflictError("档案登记在冷层，但冷存储卷未挂载，拒绝下载")
+            return self.cold_root
+        return self.root
 
     # ------------------------------------------------------------------ locking
     @contextmanager
@@ -310,6 +342,10 @@ class Storage:
             conn.execute("ALTER TABLE deliveries ADD COLUMN actual_sha256 TEXT")
         if "pub_recovered" not in columns:
             conn.execute("ALTER TABLE deliveries ADD COLUMN pub_recovered TEXT")
+        if "tier" not in columns:
+            conn.execute(
+                "ALTER TABLE deliveries ADD COLUMN tier TEXT NOT NULL DEFAULT 'hot'"
+            )
 
     def sanitize_startup(self) -> None:
         """Clean up artifacts of an interrupted write, then resume safe work.
@@ -318,16 +354,24 @@ class Storage:
         cannot damage a valid archive. A published row whose file vanished is left
         alone: downloads fail closed. Waiting deliveries that already have enough
         material are retried, which covers a crash between rename and commit.
+        Tier reconciliation finishes or undoes interrupted cold-storage
+        migrations before any of that.
         """
         partials = list(self.tmp_dir.glob("*.part"))
         if self.published_dir.is_dir():
             partials += list(self.published_dir.rglob("*.part"))
+        if self.cold_root is not None and self.cold_tmp_dir is not None:
+            partials += list(self.cold_tmp_dir.glob("*.part"))
+            cold_published = self.cold_root / "published"
+            if cold_published.is_dir():
+                partials += list(cold_published.rglob("*.part"))
         with self._critical():
             for path in partials:
                 try:
                     path.unlink()
                 except OSError:
                     pass
+        self._reconcile_tiers()
         with self._db() as conn:
             rows = conn.execute(
                 "SELECT transfer_id FROM deliveries WHERE status=?", (STATUS_WAITING,)
@@ -538,6 +582,7 @@ class Storage:
             published_sha256=row["pub_sha256"],
             published_size=row["pub_size"],
             published_at=row["pub_at"],
+            tier=row["tier"] or TIER_HOT,
             missing_frames=missing,
             parity_recoverable=recoverable,
             actual_sha256=row["actual_sha256"],
@@ -735,7 +780,7 @@ class Storage:
         row = self._delivery_row(tid)
         if row["status"] != STATUS_PUBLISHED or not row["pub_path"]:
             raise NotFoundError("该传输号尚未发布可下载档案")
-        path = self.root / row["pub_path"]
+        path = self._tier_root(row["tier"]) / row["pub_path"]
         if not path.is_file():
             raise NotFoundError("已发布档案文件缺失，拒绝下载")
         if path.stat().st_size != int(row["pub_size"]):
@@ -744,6 +789,277 @@ class Storage:
         if digest != row["pub_sha256"]:
             raise ConflictError("已发布档案摘要与登记不符，拒绝下载")
         return path, digest
+
+    def read_published(self, transfer_id: str) -> tuple[bytes, str, str]:
+        """Return (content, digest, tier) for a published archive, race-safely.
+
+        A concurrent migration can flip the tier and unlink the old copy
+        between resolving the path and opening it; that only makes the open
+        fail, never serves partial bytes, so re-resolve and retry. An
+        already-open file survives unlinking and published files are
+        immutable, so verified bytes are always the whole registered archive.
+        """
+        tid = normalize_transfer_id(transfer_id)
+        for _attempt in range(3):
+            row = self._delivery_row(tid)
+            if row["status"] != STATUS_PUBLISHED or not row["pub_path"]:
+                raise NotFoundError("该传输号尚未发布可下载档案")
+            tier = row["tier"] or TIER_HOT
+            path = self._tier_root(tier) / row["pub_path"]
+            try:
+                data = path.read_bytes()
+            except FileNotFoundError:
+                continue  # tier switched concurrently; re-resolve and retry
+            except OSError as exc:
+                raise NotFoundError("已发布档案文件缺失，拒绝下载") from exc
+            if len(data) != int(row["pub_size"]):
+                raise ConflictError("已发布档案大小与登记不符，拒绝下载")
+            digest = hashlib.sha256(data).hexdigest()
+            if digest != row["pub_sha256"]:
+                raise ConflictError("已发布档案摘要与登记不符，拒绝下载")
+            return data, digest, tier
+        raise NotFoundError("已发布档案文件缺失，拒绝下载")
+
+    # ------------------------------------------------------ cold-tier migration
+    def migrate_to_cold(self, transfer_id: str) -> dict:
+        """Move a published archive to the cold storage volume, crash-safely.
+
+        Protocol: copy to a cold ``tmp/*.part`` file -> fsync -> read-back
+        verify against the registered size/SHA-256 -> atomic rename -> verify
+        the final cold copy again -> flip ``tier`` in SQLite -> delete the hot
+        copy. Any interruption leaves either the hot copy authoritative
+        (``tier=hot``) or both copies complete (``tier=cold``); startup
+        reconciliation finishes interrupted switches and cleanups. A partial
+        file is never treated as migrated: temp files carry ``.part`` and a
+        surviving final file is only trusted after re-verification.
+        """
+        tid = normalize_transfer_id(transfer_id)
+        if self.cold_root is None or self.cold_tmp_dir is None:
+            raise StorageError("未配置冷存储卷（ARCHIVE_COLD_DIR），无法迁移")
+        with self._critical():
+            row = self._delivery_row(tid)
+            if row["status"] != STATUS_PUBLISHED or not row["pub_path"]:
+                raise ConflictError("仅已核验发布的档案可迁移到冷存储")
+            rel = row["pub_path"]
+            size = int(row["pub_size"])
+            sha = row["pub_sha256"]
+            hot_path = self.root / rel
+            cold_path = self.cold_root / rel
+
+            if (row["tier"] or TIER_HOT) == TIER_COLD:
+                # Idempotent re-entry: the switch already happened; make sure
+                # an interrupted cleanup still finishes.
+                self._check_file(cold_path, size, sha)
+                removed = self._remove_hot_copy(tid, hot_path)
+                return {
+                    "transfer_id": tid,
+                    "tier": TIER_COLD,
+                    "migrated": False,
+                    "reason": "already-cold",
+                    "hot_copy_removed": removed,
+                }
+
+            copied = False
+            if self._file_matches(cold_path, size, sha):
+                # A previous attempt crashed between rename and the DB switch;
+                # the surviving cold copy has just been re-verified.
+                pass
+            else:
+                if cold_path.exists():
+                    # Unverified leftover: never trust it, recopy from source.
+                    try:
+                        cold_path.unlink()
+                        _fsync_dir(cold_path.parent)
+                    except OSError:
+                        pass
+                self._check_file(hot_path, size, sha)  # source must be intact
+                tmp_path = self.cold_tmp_dir / f"{uuid.uuid4().hex}.part"
+                try:
+                    _copy_file(hot_path, tmp_path)
+                    self._check_file(tmp_path, size, sha)  # read-back verify
+                    cold_path.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(tmp_path, cold_path)
+                    _fsync_dir(cold_path.parent)
+                    _fsync_dir(self.cold_tmp_dir)
+                except BaseException:
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+                    raise
+                copied = True
+
+            # Final guard: never switch to an unverified cold copy.
+            self._check_file(cold_path, size, sha)
+
+            now = utcnow()
+            switched = False
+            with self._db() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    cur = conn.execute(
+                        "UPDATE deliveries SET tier=?, updated_at=?"
+                        " WHERE transfer_id=? AND tier=?",
+                        (TIER_COLD, now, tid, TIER_HOT),
+                    )
+                    switched = cur.rowcount > 0
+                    if switched:
+                        if copied:
+                            self._audit(
+                                conn, tid, "migrate-copy",
+                                f"冷盘副本已核验：{size} 字节 / {sha}",
+                            )
+                        self._audit(
+                            conn, tid, "migrate-switch",
+                            "存储层切换：热层·采集盘 → 冷层·归档卷；下载地址不变",
+                        )
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+
+            removed = self._remove_hot_copy(tid, hot_path)
+            return {
+                "transfer_id": tid,
+                "tier": TIER_COLD,
+                "migrated": True,
+                "copied": copied,
+                "switched": switched,
+                "hot_copy_removed": removed,
+                "size_bytes": size,
+                "sha256": sha,
+            }
+
+    def _remove_hot_copy(self, tid: str, hot_path: Path) -> bool:
+        """Best-effort removal of the fast-disk copy after the tier switched.
+
+        A failure only defers cleanup to the next startup reconciliation; the
+        cold copy is already authoritative, so this never affects downloads.
+        """
+        try:
+            hot_path.unlink()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+        _fsync_dir(hot_path.parent)
+        try:
+            with self._db() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._audit(conn, tid, "migrate-cleanup", "快盘副本已清理，采集盘空间已释放")
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+        except Exception:
+            pass  # the file is gone; the audit note is best-effort
+        return True
+
+    def _reconcile_tiers(self) -> None:
+        """Finish or undo interrupted migrations after a restart.
+
+        * ``tier=cold``, cold copy verifies, hot leftover exists -> remove it.
+        * ``tier=cold``, cold copy missing/tampered, hot copy verifies -> roll
+          the tier back to hot so downloads keep working.
+        * ``tier=hot``, hot copy missing/tampered, cold copy verifies ->
+          complete the interrupted switch.
+        Anything else is left untouched and downloads fail closed.
+        """
+        if self.cold_root is None:
+            return
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT transfer_id FROM deliveries"
+                " WHERE status=? AND pub_path IS NOT NULL",
+                (STATUS_PUBLISHED,),
+            ).fetchall()
+        for row in rows:
+            try:
+                with self._critical():
+                    self._reconcile_tier_locked(row["transfer_id"])
+            except Exception:
+                # Startup must not fail because one delivery cannot reconcile.
+                continue
+
+    def _reconcile_tier_locked(self, tid: str) -> None:
+        row = self._delivery_row(tid)  # re-read under the lock
+        if row["status"] != STATUS_PUBLISHED or not row["pub_path"]:
+            return
+        rel = row["pub_path"]
+        size = int(row["pub_size"])
+        sha = row["pub_sha256"]
+        hot_path = self.root / rel
+        cold_path = self.cold_root / rel
+        hot_ok = self._file_matches(hot_path, size, sha)
+        cold_ok = self._file_matches(cold_path, size, sha)
+        now = utcnow()
+        if (row["tier"] or TIER_HOT) == TIER_COLD:
+            if cold_ok:
+                if hot_path.exists():
+                    self._remove_hot_copy(tid, hot_path)
+            elif hot_ok:
+                with self._db() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        cur = conn.execute(
+                            "UPDATE deliveries SET tier=?, updated_at=?"
+                            " WHERE transfer_id=? AND tier=?",
+                            (TIER_HOT, now, tid, TIER_COLD),
+                        )
+                        if cur.rowcount:
+                            self._audit(
+                                conn, tid, "migrate-rollback",
+                                "冷盘副本缺失或被篡改，已回退到热层副本（下载不受影响）",
+                            )
+                        conn.execute("COMMIT")
+                    except Exception:
+                        conn.execute("ROLLBACK")
+                        raise
+            # Both copies bad: leave the row untouched; downloads fail closed.
+        else:
+            if not hot_ok and cold_ok:
+                with self._db() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        cur = conn.execute(
+                            "UPDATE deliveries SET tier=?, updated_at=?"
+                            " WHERE transfer_id=? AND tier=?",
+                            (TIER_COLD, now, tid, TIER_HOT),
+                        )
+                        if cur.rowcount:
+                            self._audit(
+                                conn, tid, "migrate-resume",
+                                "重启自愈：完成中断的迁移切换，冷盘副本已重新核验",
+                            )
+                        conn.execute("COMMIT")
+                    except Exception:
+                        conn.execute("ROLLBACK")
+                        raise
+                if hot_path.exists():
+                    self._remove_hot_copy(tid, hot_path)
+
+    @staticmethod
+    def _file_matches(path: Path, size: int, sha256: str) -> bool:
+        """True only if ``path`` holds exactly the registered bytes."""
+        try:
+            if not path.is_file() or path.stat().st_size != int(size):
+                return False
+            return hashlib.sha256(path.read_bytes()).hexdigest() == sha256
+        except OSError:
+            return False
+
+    @staticmethod
+    def _check_file(path: Path, size: int, sha256: str) -> None:
+        """Raise unless ``path`` holds exactly the registered bytes."""
+        if not path.is_file():
+            raise NotFoundError(f"档案文件缺失：{path.name}")
+        actual = path.stat().st_size
+        if actual != int(size):
+            raise ConflictError(f"档案大小与登记不符（{actual} ≠ {size}），拒绝使用")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != sha256:
+            raise ConflictError("档案摘要与登记不符，拒绝使用")
 
     # ---------------------------------------------------------------- helpers
     def _require_delivery(self, tid: str) -> Delivery:
@@ -827,6 +1143,18 @@ def _delivery_from_row(row: sqlite3.Row) -> Delivery:
         sha256=row["sha256"],
         created_at=row["created_at"],
     )
+
+
+def _copy_file(src: Path, dst: Path) -> None:
+    """Copy ``src`` to a fresh temp file ``dst`` and fsync it."""
+    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+        while True:
+            chunk = fsrc.read(1024 * 1024)
+            if not chunk:
+                break
+            fdst.write(chunk)
+        fdst.flush()
+        os.fsync(fdst.fileno())
 
 
 def _fsync_dir(path: Path) -> None:

@@ -4,6 +4,9 @@
 服务逐帧接收、按校验帧恢复单帧丢失、按原档字节数截断并以 **SHA-256** 核验通过后，
 才原子发布可供震相分析下载的完整档案。**丢一帧不再丢弃整档。**
 
+已核验发布的档案可一键**迁移到冷存储卷**为采集盘腾出空间：冷盘副本按登记字节数与
+SHA-256 核验一致后才切换存储层，**下载地址不变**，迁移期间下载不中断。
+
 技术栈：FastAPI · SQLite（WAL）· Jinja2 网页 · 原生文件系统分片存储 · Docker Compose。
 
 ---
@@ -12,11 +15,13 @@
 
 ```bash
 docker compose up --build
-# 打开 http://localhost:8080
+# 打开 http://localhost:8080 （第二实例 http://localhost:8081）
 ```
 
-数据（SQLite 元数据、分片、已发布档案）保存在命名卷 `archive-data` 的 `/data`；
-`./samples` 以只读方式挂载到容器内 `/app/samples`。修改端口：`INTAKE_PORT=9000 docker compose up`。
+数据保存在两个命名卷：热层（SQLite 元数据、分片、已发布档案）在 `archive-data` 的 `/data`，
+冷层归档卷在 `archive-cold` 的 `/cold`；`./samples` 以只读方式挂载到容器内 `/app/samples`。
+compose 默认启动**两个 Web 实例**（8080/8081）挂载同一组卷，用于验证多实例并发迁移与下载安全；
+单实例够用时可删除 `intake-b`。修改端口：`INTAKE_PORT=9000 INTAKE_B_PORT=9001 docker compose up`。
 
 不用 Docker 的本地运行：
 
@@ -25,6 +30,7 @@ python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8080
 # 数据目录默认 ./data，可用 ARCHIVE_DATA_DIR=/srv/archive 覆盖
+# 冷存储卷默认不配置（迁移按钮不出现），用 ARCHIVE_COLD_DIR=/srv/cold 启用
 ```
 
 ---
@@ -38,6 +44,9 @@ uvicorn app.main:app --reload --port 8080
 4. 系统自动判定：齐帧直接组装；缺一帧且已有校验帧则恢复后组装；缺多帧则继续等待补传。
 5. 组装结果按原档字节数截断并核对 SHA-256，通过后原子发布并可下载；不通过则保留全部分片，
    等待补帧后重新核验（网页上有「重新核验现有分片」按钮）。
+6. **（可选）迁移到冷存储**：已发布的档案在详情页点「迁移到冷存储卷」。系统先把档案复制到
+   冷盘临时文件、回读核验字节数与 SHA-256，一致后原子改名并再次核验，然后才切换存储层，
+   最后清理快盘副本。网页与接口会显示档案所在存储层（热层·采集盘 / 冷层·归档卷）。
 
 ### CSV 格式
 
@@ -76,11 +85,13 @@ frame_no,payload_hex
 | POST | `/deliveries/{tid}/frames` | 网页表单上传 CSV（文件或粘贴，multipart） |
 | POST | `/deliveries/{tid}/parity` | 网页表单上传校验帧 |
 | POST | `/deliveries/{tid}/verify` | 重新核验现有分片 |
-| GET | `/deliveries/{tid}/download` | 下载已发布档案，响应头带 `X-Archive-SHA256` |
+| POST | `/deliveries/{tid}/migrate` | 网页表单迁移已发布档案到冷存储卷（303 跳转） |
+| GET | `/deliveries/{tid}/download` | 下载已发布档案（与存储层无关），响应头带 `X-Archive-SHA256`、`X-Archive-Tier` |
 | POST | `/api/deliveries` | JSON 登记 |
 | POST | `/api/deliveries/{tid}/frames` | JSON 上传 `{"frames":[{"frame_no":1,"payload_hex":"..."}]}` |
 | POST | `/api/deliveries/{tid}/parity` | JSON 上传 `{"payload_hex":"..."}` |
-| GET | `/api/deliveries` / `/api/deliveries/{tid}` | 台账 / 单档状态（含缺帧、恢复帧、实际摘要） |
+| POST | `/api/deliveries/{tid}/migrate` | JSON 迁移到冷存储卷（幂等） |
+| GET | `/api/deliveries` / `/api/deliveries/{tid}` | 台账 / 单档状态（含缺帧、恢复帧、实际摘要、存储层 `tier`） |
 | GET | `/api/deliveries/{tid}/download` | 下载 |
 | GET | `/docs` | 交互式接口文档 |
 
@@ -129,6 +140,23 @@ python3 scripts/make_samples.py
 - **恢复帧不落库**：校验帧恢复的帧只用于当次组装的内存。它不会被记为已收帧，
   真实帧补传时仍会被接受（可修正错误恢复），也就不会因「同帧号不同内容」而拒收。
 
+### 冷存储迁移的可靠性
+
+- **先核验后切换**：冷盘副本写入 `tmp/*.part`、`fsync`、按登记字节数与 SHA-256 回读核验，
+  原子改名到冷层最终路径后**再核验一次**，全部通过才在 SQLite 中把 `tier` 翻为 `cold`，
+  最后才删除快盘副本。任何时刻中断，下载端要么走热层要么走冷层，两边都是完整档案。
+- **残件永不被当成已迁移**：冷盘临时文件一律带 `.part` 后缀，重启即清；切换前崩溃留下的
+  冷层最终文件也只在重新核验通过后才会被采用，核验不过则删除重拷。
+- **重启对账**：启动时逐档核对两层副本——`tier=cold` 且冷盘副本完好则补删快盘残留；
+  冷盘副本丢失/被篡改而热层副本完好则回退到热层；`tier=hot` 而热层副本丢失、
+  冷盘副本核验通过则补完中断的切换。两层都坏时保持原状、下载失败关闭。
+- **多实例与并发下载安全**：迁移全程持有跨进程文件锁，两个实例同时迁移同一档案只会
+  执行一次（幂等）；下载按「读登记 → 打开 → 核验」重试，切换或删旧件只会触发重定位，
+  已打开的文件句柄不受删除影响，**绝不会返回半截或串档的波形**。
+- **存储层可见**：网页与 `/api/deliveries*` 均显示 `tier`（热层·采集盘 / 冷层·归档卷），
+  下载响应头带 `X-Archive-Tier`；未配置 `ARCHIVE_COLD_DIR` 时迁移按钮与接口不可用，
+  其余功能不受影响。
+
 ### 一个明确的取舍
 
 同帧号不同内容一律拒收，因此**摘要不符的档案不能原地覆盖损坏分片**：系统只能保留分片、
@@ -146,7 +174,9 @@ pytest -q
 
 覆盖：CSV 解析与校验、缺单帧校验帧恢复、缺多帧等待、末帧补零截断、摘要不符保留分片、
 同帧号冲突拒收、幂等重传、同批冲突、发布后迟到分片不改档、写盘中断与重启自愈、
-已发布文件被截断时拒绝下载、多线程/多进程并发补齐只发布一份。
+已发布文件被截断时拒绝下载、多线程/多进程并发补齐只发布一份；
+冷存储迁移的核验切换、幂等重迁、复制/切换/清理中断后的重启对账、
+冷盘残件拒信、冷盘损坏回退热层、多实例并发迁移与并发下载只返回完整原档。
 
 ---
 
