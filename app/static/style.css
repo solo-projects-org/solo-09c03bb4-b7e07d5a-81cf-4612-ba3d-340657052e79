@@ -121,6 +121,14 @@ button:hover, .button:hover { filter: brightness(1.08); }
 
 .mono { font-family: var(--mono); }
 .small { font-size: .78rem; }
+.muted { color: var(--muted); }
+.tier {
+  display: inline-block; padding: .12rem .5rem; border-radius: 999px;
+  font-size: .76rem; font-weight: 600; white-space: nowrap;
+  border: 1px solid currentColor;
+}
+.tier.hot { color: var(--warn); }
+.tier.cold { color: var(--accent); }
 .ellipsis { display: inline-block; max-width: 130px; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
 .verified { color: var(--ok); word-break: break-all; }
 .bad { color: var(--bad); word-break: break-all; }

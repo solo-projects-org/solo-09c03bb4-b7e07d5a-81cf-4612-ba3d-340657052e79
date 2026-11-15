@@ -45,7 +45,7 @@
     <table class="ledger-table">
       <thead>
         <tr>
-          <th>传输号</th><th>帧进度</th><th>声明</th><th>状态</th><th>更新时间 / 发布</th>
+          <th>传输号</th><th>帧进度</th><th>声明</th><th>状态</th><th>存储层</th><th>更新时间 / 发布</th>
         </tr>
       </thead>
       <tbody>
@@ -72,6 +72,14 @@
             <span class="ellipsis">{{ item.delivery.sha256 }}</span>
           </td>
           <td><span class="badge {{ item.state.status }}">{{ item.status_label }}</span></td>
+          <td>
+            {% if item.state.status == 'published' %}
+            <span class="tier {{ item.tier }}">{{ item.tier_label }}</span>
+            {% if item.cold_error %}<br><small class="bad">{{ item.cold_error }}</small>{% endif %}
+            {% else %}
+            <span class="muted">—</span>
+            {% endif %}
+          </td>
           <td class="mono small">
             {{ item.state.published_at or item.delivery.created_at }}
             {% if item.downloadable %}

@@ -14,8 +14,49 @@ from app.storage import FRAME_BYTES, xor_bytes  # noqa: E402
 def client(tmp_path):
     from fastapi.testclient import TestClient
 
-    app = create_app(tmp_path / "data")
+    # Explicit cold_root=None keeps the fixture independent of the developer's
+    # environment (ARCHIVE_COLD_DIR must not leak into these tests).
+    app = create_app(tmp_path / "data", cold_root=None)
     return TestClient(app)
+
+
+@pytest.fixture
+def tiered_client(tmp_path):
+    from fastapi.testclient import TestClient
+
+    app = create_app(tmp_path / "data", cold_root=tmp_path / "cold")
+    return TestClient(app)
+
+
+def test_app_reads_cold_dir_from_environment(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("ARCHIVE_COLD_DIR", str(tmp_path / "envcold"))
+    app = create_app(tmp_path / "envdata")
+    client = TestClient(app)
+    health = client.get("/healthz").json()
+    assert health["cold_dir"] == str(tmp_path / "envcold")
+
+
+def publish_via_api(client, tid: str, case) -> None:
+    client.post(
+        "/api/deliveries",
+        json={
+            "transfer_id": tid,
+            "frame_count": len(case["frames"]),
+            "size_bytes": len(case["archive"]),
+            "sha256": case["sha256"],
+        },
+    )
+    client.post(
+        f"/api/deliveries/{tid}/frames",
+        json={
+            "frames": [
+                {"frame_no": i, "payload_hex": frame.hex()}
+                for i, frame in enumerate(case["frames"], start=1)
+            ]
+        },
+    )
 
 
 def make_case(count: int, size: int, tid: str, *, digest: str | None = None):
@@ -205,6 +246,90 @@ def test_unknown_transfer_page_is_404(client):
     assert client.get("/deliveries/NOPE").status_code == 404
     assert client.get("/api/deliveries/NOPE").status_code == 404
     assert client.get("/deliveries/NOPE/download").status_code == 404
+
+
+# --------------------------------------------------------------- cold tier UI
+def test_page_shows_hot_tier_and_migration_button(tiered_client):
+    case = make_case(3, 600, "TIER-1")
+    publish_via_api(tiered_client, "TIER-1", case)
+    detail = tiered_client.get("/deliveries/TIER-1").text
+    assert "快盘（采集卷）" in detail
+    assert "/deliveries/TIER-1/archive" in detail
+    api = tiered_client.get("/api/deliveries/TIER-1").json()
+    assert api["storage"]["tier"] == "hot"
+
+
+def test_web_migration_keeps_download_url_working(tiered_client, tmp_path):
+    case = make_case(4, 900, "TIER-2")
+    publish_via_api(tiered_client, "TIER-2", case)
+    response = tiered_client.post("/deliveries/TIER-2/archive", follow_redirects=False)
+    assert response.status_code == 303
+    assert "ok=" in response.headers["location"]
+
+    download = tiered_client.get("/deliveries/TIER-2/download")
+    assert download.status_code == 200
+    assert download.content == case["archive"]
+    assert download.headers["x-archive-sha256"] == case["sha256"]
+    api_download = tiered_client.get("/api/deliveries/TIER-2/download")
+    assert api_download.content == case["archive"]
+
+    # Cold copy exists, hot copy is gone, and the page reflects the new tier.
+    store = tiered_client.app.state.storage
+    cold_files = list((store.cold_root / "published").rglob("*.bin"))
+    assert len(cold_files) == 1 and cold_files[0].read_bytes() == case["archive"]
+    assert list((store.published_dir / "TIER-2").rglob("*.bin")) == []
+    detail = tiered_client.get("/deliveries/TIER-2").text
+    assert "冷存储卷" in detail
+    assert "/deliveries/TIER-2/archive" not in detail
+    ledger = tiered_client.get("/").text
+    assert "冷存储卷" in ledger
+
+
+def test_api_migration_is_idempotent(tiered_client):
+    case = make_case(2, 400, "TIER-3")
+    publish_via_api(tiered_client, "TIER-3", case)
+    first = tiered_client.post("/api/deliveries/TIER-3/archive").json()
+    second = tiered_client.post("/api/deliveries/TIER-3/archive").json()
+    assert first["migrated"] is True
+    assert second["migrated"] is False
+    assert second["reason"] == "already-cold"
+    assert tiered_client.get("/deliveries/TIER-3/download").content == case["archive"]
+
+
+def test_migration_of_unpublished_delivery_is_refused(tiered_client):
+    tiered_client.post(
+        "/api/deliveries",
+        json={"transfer_id": "TIER-4", "frame_count": 2, "size_bytes": 300,
+              "sha256": "0" * 64},
+    )
+    response = tiered_client.post("/api/deliveries/TIER-4/archive")
+    assert response.status_code == 404
+    page = tiered_client.post("/deliveries/TIER-4/archive", follow_redirects=False)
+    assert "err=" in page.headers["location"]
+
+
+def test_no_cold_volume_means_no_migration_ui(client):
+    case = make_case(2, 400, "TIER-5")
+    publish_via_api(client, "TIER-5", case)
+    detail = client.get("/deliveries/TIER-5").text
+    assert "未挂载独立冷存储卷" in detail
+    assert "/deliveries/TIER-5/archive" not in detail
+    response = client.post("/api/deliveries/TIER-5/archive")
+    assert response.status_code == 400
+
+
+def test_late_upload_after_migration_does_not_create_hot_copy(tiered_client):
+    case = make_case(3, 600, "TIER-6")
+    publish_via_api(tiered_client, "TIER-6", case)
+    tiered_client.post("/api/deliveries/TIER-6/archive")
+    tiered_client.post(
+        "/api/deliveries/TIER-6/frames",
+        json={"frames": [{"frame_no": 1, "payload_hex": case["frames"][0].hex()}]},
+    )
+    store = tiered_client.app.state.storage
+    assert store.state("TIER-6").storage_tier == "cold"
+    assert list(store.published_dir.rglob("*.bin")) == []
+    assert tiered_client.get("/deliveries/TIER-6/download").content == case["archive"]
 
 
 def test_healthz(client):

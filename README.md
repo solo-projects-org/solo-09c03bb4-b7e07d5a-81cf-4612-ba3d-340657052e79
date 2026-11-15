@@ -3,6 +3,7 @@
 面向地震台数据员的卫星链路波形归档服务：波形原档被切成 **256 字节定长帧**分批送达，
 服务逐帧接收、按校验帧恢复单帧丢失、按原档字节数截断并以 **SHA-256** 核验通过后，
 才原子发布可供震相分析下载的完整档案。**丢一帧不再丢弃整档。**
+已核验档案可从网页迁入独立的冷存储卷，腾出采集盘空间，**原下载地址不变**。
 
 技术栈：FastAPI · SQLite（WAL）· Jinja2 网页 · 原生文件系统分片存储 · Docker Compose。
 
@@ -15,7 +16,11 @@ docker compose up --build
 # 打开 http://localhost:8080
 ```
 
-数据（SQLite 元数据、分片、已发布档案）保存在命名卷 `archive-data` 的 `/data`；
+数据分两个命名卷保存：
+
+- `archive-data` → 容器内 `/data`：SQLite 元数据、分片、已发布档案（**快盘 / 采集盘**）。
+- `archive-cold` → 容器内 `/cold`：独立**冷存储卷**，存放迁入的已核验档案。
+
 `./samples` 以只读方式挂载到容器内 `/app/samples`。修改端口：`INTAKE_PORT=9000 docker compose up`。
 
 不用 Docker 的本地运行：
@@ -25,7 +30,11 @@ python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8080
 # 数据目录默认 ./data，可用 ARCHIVE_DATA_DIR=/srv/archive 覆盖
+# 冷存储目录用 ARCHIVE_COLD_DIR=/mnt/cold 指定；不设置则只在快盘发布，网页不显示迁移按钮
 ```
+
+`ARCHIVE_COLD_DIR` 必须与 `ARCHIVE_DATA_DIR` 是**互相独立、不可嵌套**的目录，否则启动即报错，
+以免清理快盘副本时误删唯一存活的档案。
 
 ---
 
@@ -38,6 +47,9 @@ uvicorn app.main:app --reload --port 8080
 4. 系统自动判定：齐帧直接组装；缺一帧且已有校验帧则恢复后组装；缺多帧则继续等待补传。
 5. 组装结果按原档字节数截断并核对 SHA-256，通过后原子发布并可下载；不通过则保留全部分片，
    等待补帧后重新核验（网页上有「重新核验现有分片」按钮）。
+6. **（可选）迁入冷存储**：已核验发布的档案在网页点「迁入冷存储并清理快盘副本」。
+   冷盘副本与登记的字节数、SHA-256 一致后才切换存储位置，随后清理快盘副本；
+   网页与 API 都会显示档案当前所在的存储层。
 
 ### CSV 格式
 
@@ -76,15 +88,18 @@ frame_no,payload_hex
 | POST | `/deliveries/{tid}/frames` | 网页表单上传 CSV（文件或粘贴，multipart） |
 | POST | `/deliveries/{tid}/parity` | 网页表单上传校验帧 |
 | POST | `/deliveries/{tid}/verify` | 重新核验现有分片 |
+| POST | `/deliveries/{tid}/archive` | 网页表单迁入冷存储（303 跳转） |
 | GET | `/deliveries/{tid}/download` | 下载已发布档案，响应头带 `X-Archive-SHA256` |
 | POST | `/api/deliveries` | JSON 登记 |
 | POST | `/api/deliveries/{tid}/frames` | JSON 上传 `{"frames":[{"frame_no":1,"payload_hex":"..."}]}` |
 | POST | `/api/deliveries/{tid}/parity` | JSON 上传 `{"payload_hex":"..."}` |
-| GET | `/api/deliveries` / `/api/deliveries/{tid}` | 台账 / 单档状态（含缺帧、恢复帧、实际摘要） |
+| POST | `/api/deliveries/{tid}/archive` | JSON 迁入冷存储（幂等） |
+| GET | `/api/deliveries` / `/api/deliveries/{tid}` | 台账 / 单档状态（含缺帧、恢复帧、实际摘要、存储层） |
 | GET | `/api/deliveries/{tid}/download` | 下载 |
 | GET | `/docs` | 交互式接口文档 |
 
-错误约定：参数错误 `400`，同帧号不同内容等冲突 `409`，未知传输号 / 未发布 `404`。
+错误约定：参数错误 `400`，同帧号不同内容等冲突 `409`，未知传输号 / 未发布 / 档案缺失 `404`，
+冷存储卷不可写或未挂载 `503`。
 
 ---
 
@@ -114,6 +129,41 @@ python3 scripts/make_samples.py
 
 ---
 
+## 冷存储分层迁移
+
+采集盘空间有限，已核验的档案可以迁到 Docker Compose 单独挂载的冷存储卷（`archive-cold`）。
+只有 **已核验发布**的档案可以迁移；等待补帧、摘要不符的档案仍留在快盘，分片与补传流程完全不变。
+
+迁移按固定顺序执行，**任何一步中断都不会把残件当成已迁移档案**：
+
+1. 先把快盘档案流式复制到 `冷卷/tmp/*.part`，边写边算 SHA-256，`fsync` 后核对字节数与摘要；
+2. `fsync` 后 `rename` 到冷卷内容寻址路径 `冷卷/published/<传输号>/<传输号>-<sha256>.bin`；
+3. 重新读取冷盘最终文件，再次核对登记字节数与 SHA-256（防御性复验）；
+4. 上述全部一致后，才在 SQLite 中把 `storage_tier` 从 `hot` 切换为 `cold`（切换点）；
+5. 切换提交成功后才删除快盘副本。
+
+由此得到的保证：
+
+- **复制中断**（步骤 1～3 之间）：数据库仍指向快盘，冷盘上的 `*.part` 与未登记的成品文件都是残件；
+  重启时统一删除，**不会被误认成已迁移档案**。重试即可重来。
+- **切换中断**（步骤 4 之后、删快盘之前）：冷盘副本已核验且数据库已提交，重启时补删快盘副本。
+- **冷盘副本缺失或损坏**：若快盘副本仍在且校验一致，自动回退到快盘（`storage_tier=hot`）；
+  否则保留 `cold` 状态但**拒绝下载**并在网页/API 显示原因，绝不返回坏波形。
+- **并发**：迁移与下载分别取 `fcntl` 排他锁 / 共享锁。两个 Web 实例同时迁移同一档案时，
+  只有一个能完成切换，另一个得到「已在冷存储」的幂等结果；下载在整段读取期间持有共享锁，
+  因此不会读到正在被切换或删除的文件，也不会拿到半截档。
+- **原下载地址不变**：`/deliveries/{tid}/download` 与 `/api/.../download` 始终有效，
+  服务内部按存储层选择实际文件，切换前后都返回完整且核验一致的字节。
+- **网页显示存储层**：台账新增「存储层」列，详情页显示快盘 / 冷存储及冷盘副本的核验信息；
+  `GET /api/deliveries/{tid}` 的 `storage` 字段给出 `tier`、`tier_label` 与 `cold` 详情。
+- **冷卷未挂载**时不显示迁移入口，迁移请求报 `503`；已迁入冷存储的档案在冷卷缺席时拒绝下载而不是
+  回退到不存在的快盘副本。
+
+冷卷布局与快盘一致（内容寻址文件名），可以单独备份或搬运；`冷卷/tmp` 永远是临时区，
+`冷卷/published` 下没有数据库登记的文件会在启动时清理。
+
+---
+
 ## 可靠性与并发保证
 
 - **原子发布**：先写入 `tmp/*.part`，`fsync` 后 `rename` 到暂存名，再 `rename` 为
@@ -125,6 +175,7 @@ python3 scripts/make_samples.py
   下载前按登记大小与摘要再次核对。
 - **并发安全**：进程内线程锁 + `fcntl` 文件锁串行化「写入 → 组装 → 发布」，SQLite 使用
   `BEGIN IMMEDIATE` 与 WAL。多 worker / 多进程同时补齐同一传输号也只产生一份发布。
+  下载取共享锁、发布与冷存储迁移取排他锁，三者互不越过半成品。
 - **冲突拒收**：同传输号同帧号不同内容（含同批内冲突、校验帧冲突）整批拒绝，已存分片不变。
 - **恢复帧不落库**：校验帧恢复的帧只用于当次组装的内存。它不会被记为已收帧，
   真实帧补传时仍会被接受（可修正错误恢复），也就不会因「同帧号不同内容」而拒收。
@@ -146,7 +197,9 @@ pytest -q
 
 覆盖：CSV 解析与校验、缺单帧校验帧恢复、缺多帧等待、末帧补零截断、摘要不符保留分片、
 同帧号冲突拒收、幂等重传、同批冲突、发布后迟到分片不改档、写盘中断与重启自愈、
-已发布文件被截断时拒绝下载、多线程/多进程并发补齐只发布一份。
+已发布文件被截断时拒绝下载、多线程/多进程并发补齐只发布一份；
+冷存储迁移（复制后核验、切换存储层、清理快盘副本、中断后重启自愈、冷盘副本损坏回退/拒下载、
+多实例并发迁移只切换一次、下载与迁移并发时只返回完整档案、迁移后原下载地址仍可用）。
 
 ---
 
@@ -155,11 +208,18 @@ pytest -q
 ```
 app/
   main.py        FastAPI 路由（网页 + JSON API）
-  storage.py     分片入库、XOR 恢复、原子发布、SQLite 元数据
+  storage.py     分片入库、XOR 恢复、原子发布、冷存储迁移、SQLite 元数据
   csvintake.py   CSV 解析与帧校验
   templates/     Jinja2 页面
   static/        样式
 samples/         虚构波形分片与期望原档
 scripts/         样例生成、样例送达脚本
 tests/           pytest 用例
+```
+
+运行期目录（均不提交）：
+
+```
+<ARCHIVE_DATA_DIR>/            快盘：archive.sqlite3、tmp/、published/
+<ARCHIVE_COLD_DIR>/            冷卷：tmp/、published/（内容寻址副本）
 ```

@@ -8,7 +8,7 @@ from typing import Any
 from urllib.parse import quote
 
 from fastapi import Body, FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -19,6 +19,8 @@ from .storage import (
     STATUS_MISMATCH,
     STATUS_PUBLISHED,
     STATUS_WAITING,
+    TIER_COLD,
+    TIER_HOT,
     ArchiveState,
     Storage,
     StorageError,
@@ -29,10 +31,19 @@ from .storage import (
 BASE_DIR = Path(__file__).resolve().parent
 DATA_ROOT = Path(os.environ.get("ARCHIVE_DATA_DIR", BASE_DIR.parent / "data"))
 
+
+def _cold_root_from_env() -> str | None:
+    return os.environ.get("ARCHIVE_COLD_DIR", "").strip() or None
+
 STATUS_LABELS = {
     STATUS_WAITING: "等待补帧",
     STATUS_MISMATCH: "摘要不符",
     STATUS_PUBLISHED: "已核验发布",
+}
+
+TIER_LABELS = {
+    TIER_HOT: "快盘（采集卷）",
+    TIER_COLD: "冷存储卷",
 }
 
 
@@ -62,12 +73,38 @@ def api_state(state: ArchiveState) -> dict[str, Any]:
             else None
         ),
         "actual_sha256": state.actual_sha256,
+        "storage": (
+            {
+                "tier": state.storage_tier,
+                "tier_label": TIER_LABELS.get(state.storage_tier, state.storage_tier),
+                "cold": (
+                    {
+                        "sha256": state.cold_sha256,
+                        "size_bytes": state.cold_size,
+                        "at": state.cold_at,
+                    }
+                    if state.storage_tier == TIER_COLD
+                    else None
+                ),
+                "error": state.cold_error,
+            }
+            if published
+            else None
+        ),
     }
 
 
-def create_app(data_root: str | os.PathLike[str] | None = None) -> FastAPI:
+_UNSET = object()
+
+
+def create_app(
+    data_root: str | os.PathLike[str] | None = None,
+    cold_root: str | os.PathLike[str] | None | object = _UNSET,
+) -> FastAPI:
     root = Path(data_root) if data_root is not None else DATA_ROOT
-    storage = Storage(root)
+    if cold_root is _UNSET:
+        cold_root = _cold_root_from_env()
+    storage = Storage(root, cold_root)  # type: ignore[arg-type]
     templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
     app = FastAPI(
@@ -130,6 +167,11 @@ def create_app(data_root: str | os.PathLike[str] | None = None) -> FastAPI:
             "recoverable": tentative is not None,
             "has_parity": state.parity is not None,
             "downloadable": state.status == STATUS_PUBLISHED,
+            "tier": state.storage_tier,
+            "tier_label": TIER_LABELS.get(state.storage_tier, state.storage_tier),
+            "cold_enabled": storage.cold_enabled,
+            "is_cold": state.storage_tier == TIER_COLD,
+            "cold_error": state.cold_error,
         }
 
     def outcome_note(state: ArchiveState) -> str:
@@ -238,16 +280,43 @@ def create_app(data_root: str | os.PathLike[str] | None = None) -> FastAPI:
             return redirect_detail(transfer_id, "err", exc.message)
         return redirect_detail(transfer_id, "ok", outcome_note(storage.state(transfer_id)))
 
+    def archive_response(transfer_id: str) -> Response:
+        """Buffer the verified archive under the shared lock, then stream it.
+
+        Handing a path to ``FileResponse`` would release the lock before the file
+        is read, and a concurrent cold migration could delete the hot copy in
+        between. Reading the (at most 4 KiB) archive under the lock avoids that
+        race; the response body is then already complete and verified.
+        """
+        data, digest = storage.read_published(transfer_id)
+        tid = normalize_transfer_id(transfer_id)
+        return Response(
+            content=data,
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f'attachment; filename="{tid}.bin"',
+                "Content-Length": str(len(data)),
+                "X-Archive-SHA256": digest,
+                "Cache-Control": "no-store",
+            },
+        )
+
     @app.get("/deliveries/{transfer_id}/download")
     def download(transfer_id: str) -> Response:
-        path, digest = storage.published_path(transfer_id)
-        tid = normalize_transfer_id(transfer_id)
-        return FileResponse(
-            path,
-            media_type="application/octet-stream",
-            filename=f"{tid}.bin",
-            headers={"X-Archive-SHA256": digest, "Cache-Control": "no-store"},
+        return archive_response(transfer_id)
+
+    @app.post("/deliveries/{transfer_id}/archive")
+    def archive_page(transfer_id: str) -> Response:
+        try:
+            result = storage.archive_to_cold(transfer_id)
+        except StorageError as exc:
+            return redirect_detail(transfer_id, "err", exc.message)
+        note = (
+            f"已迁入冷存储（{result['size_bytes']} 字节，SHA-256 核验一致）"
+            if result["migrated"]
+            else "档案已在冷存储，无需重复迁移"
         )
+        return redirect_detail(transfer_id, "ok", note)
 
     # ---------------------------------------------------------------------- API
     @app.post("/api/deliveries")
@@ -308,17 +377,21 @@ def create_app(data_root: str | os.PathLike[str] | None = None) -> FastAPI:
 
     @app.get("/api/deliveries/{transfer_id}/download")
     def api_download(transfer_id: str) -> Response:
-        path, digest = storage.published_path(transfer_id)
-        return FileResponse(
-            path,
-            media_type="application/octet-stream",
-            filename=f"{normalize_transfer_id(transfer_id)}.bin",
-            headers={"X-Archive-SHA256": digest, "Cache-Control": "no-store"},
-        )
+        return archive_response(transfer_id)
+
+    @app.post("/api/deliveries/{transfer_id}/archive")
+    def api_archive(transfer_id: str) -> JSONResponse:
+        return JSONResponse(storage.archive_to_cold(transfer_id))
 
     @app.get("/healthz")
     def healthz() -> JSONResponse:
-        return JSONResponse({"ok": True, "data_dir": str(root)})
+        return JSONResponse(
+            {
+                "ok": True,
+                "data_dir": str(root),
+                "cold_dir": str(storage.cold_root) if storage.cold_enabled else None,
+            }
+        )
 
     return app
 

@@ -1,6 +1,9 @@
-# 地震波形原档接收台 — 单服务 + 持久卷，一条命令启动：
+# 地震波形原档接收台 — 单服务 + 双持久卷，一条命令启动：
 #   docker compose up --build
 # 打开 http://localhost:8080 ；样例分片位于镜像内 /app/samples（也可用仓库内 samples/）。
+#
+# 两个命名卷故意分开：archive-data 是快盘（采集盘），archive-cold 是独立冷存储卷。
+# 迁移时先把已核验档案复制到冷卷、核对字节数与 SHA-256，成功后才切换存储位置并清理快盘副本。
 services:
   intake:
     build:
@@ -12,9 +15,11 @@ services:
       - "${INTAKE_PORT:-8080}:8080"
     environment:
       ARCHIVE_DATA_DIR: /data
+      ARCHIVE_COLD_DIR: /cold
       TZ: Asia/Shanghai
     volumes:
       - archive-data:/data
+      - archive-cold:/cold
       - ./samples:/app/samples:ro
     restart: unless-stopped
     healthcheck:
@@ -30,3 +35,4 @@ services:
 
 volumes:
   archive-data:
+  archive-cold:

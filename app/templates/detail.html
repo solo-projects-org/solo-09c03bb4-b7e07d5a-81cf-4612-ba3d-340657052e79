@@ -24,6 +24,7 @@
     {% if view.state.status == 'published' %}
     <div><dt>发布大小</dt><dd>{{ view.state.published_size }} 字节</dd></div>
     <div><dt>发布时间</dt><dd>{{ view.state.published_at }}</dd></div>
+    <div><dt>所在存储层</dt><dd><span class="tier {{ view.tier }}">{{ view.tier_label }}</span></dd></div>
     <div class="wide"><dt>发布摘要</dt><dd class="mono verified">{{ view.state.published_sha256 }}</dd></div>
     {% elif view.state.actual_sha256 %}
     <div class="wide"><dt>当前实际摘要（不符）</dt><dd class="mono bad">{{ view.state.actual_sha256 }}</dd></div>
@@ -77,6 +78,27 @@
       已发布档案不会因迟到分片而改变。
     </div>
     <a class="button primary" href="/deliveries/{{ view.delivery.transfer_id }}/download">下载 {{ view.delivery.transfer_id }}.bin</a>
+
+    <h3>存储分层</h3>
+    <p class="hint">
+      档案当前位于 <span class="tier {{ view.tier }}">{{ view.tier_label }}</span>。
+      {% if not view.cold_enabled %}
+        未挂载独立冷存储卷，无法迁移。
+      {% elif view.is_cold %}
+        快盘上的副本已清理，下载自冷存储卷提供，原下载地址不变。
+      {% else %}
+        迁入冷存储时先复制到冷盘并核对登记字节数与 SHA-256，一致后才切换存储位置，
+        随后清理快盘副本；中断后可安全重试，原下载地址不变。
+      {% endif %}
+    </p>
+    {% if view.cold_error %}
+    <div class="alert error">上次迁移未完成：{{ view.cold_error }}</div>
+    {% endif %}
+    {% if view.cold_enabled and not view.is_cold %}
+    <form method="post" action="/deliveries/{{ view.delivery.transfer_id }}/archive">
+      <button type="submit" class="primary">迁入冷存储并清理快盘副本</button>
+    </form>
+    {% endif %}
   {% endif %}
 </section>
 
@@ -131,7 +153,9 @@
       <span class="at mono">{{ row.at }}</span>
       <span class="event">{{ {
         'registered':'登记','frames':'接收分片','parity':'接收校验帧',
-        'digest-mismatch':'摘要不符','published':'核验发布','recovered':'校验帧恢复'
+        'digest-mismatch':'摘要不符','published':'核验发布','recovered':'校验帧恢复',
+        'migrated-cold':'迁入冷存储','cold-reverted':'冷盘校验失败回退',
+        'cold-invalid':'冷盘副本异常','cold-failed':'迁移失败'
       }.get(row.event, row.event) }}</span>
       <span class="detail mono small">{{ row.detail }}</span>
     </li>
